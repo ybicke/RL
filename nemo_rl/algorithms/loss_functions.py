@@ -1210,3 +1210,256 @@ class DistillationLossFn(LossFunction):
         }
 
         return kl_loss, metrics
+
+
+# [MORALGYM PATCH 6] SDPO — Self-Distilled Policy Optimization
+# Ported from Verl: SDPO/verl/trainer/ppo/core_algos.py:1085-1188
+# (compute_self_distillation_loss). Config schema mirrors Verl's
+# SelfDistillationConfig (SDPO/verl/workers/config/actor.py:38-112).
+
+
+class SDPOLossConfig(TypedDict):
+    """Configuration for SDPO (Self-Distilled Policy Optimization) loss.
+
+    Mirrors Verl's SelfDistillationConfig verbatim so every knob maps 1:1.
+    """
+
+    full_logit_distillation: bool
+    # KL interpolation coefficient. 0.0=forward KL (student mimics teacher),
+    # 1.0=reverse KL (teacher mimics student), 0<a<1=Jensen-Shannon.
+    alpha: float
+    # If set, use top-k logit distillation. Phase 1: not supported (defer to Phase 2).
+    distillation_topk: NotRequired[Optional[int]]
+    distillation_add_tail: NotRequired[bool]
+    # Importance-sampling clip on the distillation loss. None disables IS weighting.
+    is_clip: NotRequired[Optional[float]]
+
+
+class SDPOLossDataDict(TypedDict):
+    """Required keys for SDPOLossFn.
+
+    Teacher tensors are precomputed by the policy worker on the reprompted batch
+    and pre-aligned to the student's next-token prediction positions (shape
+    [B, S-1, V]); the loss function does NOT run the teacher forward pass.
+    """
+
+    input_ids: torch.Tensor
+    token_mask: torch.Tensor
+    sample_mask: torch.Tensor
+    # [B] float mask; 1.0 for samples that got a valid demonstration or feedback,
+    # 0.0 for samples with no reprompt target. Zeros out the distillation loss
+    # contribution for the latter (mirrors Verl `self_distillation_mask`).
+    self_distillation_mask: torch.Tensor
+    # [B, S-1, V] — teacher's full-vocab log-probs on the reprompted input,
+    # pre-aligned by the policy worker to the same next-token positions as the
+    # student. Required when `full_logit_distillation=True` and `distillation_topk` is None.
+    teacher_all_logprobs: NotRequired[torch.Tensor]
+    # [B, S-1] — teacher's log-prob at the actual response token. Required for
+    # the non-full-logit reverse-KL path.
+    teacher_logprobs: NotRequired[torch.Tensor]
+    # [B, S-1] — student's log-prob under the previous policy iterate. Required
+    # only when `is_clip` is set.
+    prev_logprobs: NotRequired[torch.Tensor]
+    __extra__: Any
+
+
+class SDPOLossFn(LossFunction):
+    """Self-Distilled Policy Optimization loss (KL divergence to an EMA teacher).
+
+    Direct port of Verl's `compute_self_distillation_loss`
+    (SDPO/verl/trainer/ppo/core_algos.py:1085-1188).
+
+    SDPO REPLACES the policy-gradient loss when active — it is not blended
+    with PG. Orthogonal terms (entropy bonus, KL-to-reference) attach on top
+    of whichever base loss was selected, matching Verl `dp_actor.py:881-898`.
+
+    Formula (full-logit mode):
+        alpha = 0.0 -> L = KL(teacher || student)                (forward KL)
+        alpha = 1.0 -> L = KL(student || teacher)                (reverse KL)
+        0 < alpha < 1 -> L = generalized Jensen-Shannon via mixture
+
+    Non-full-logit mode (score-function reverse KL, matches Verl):
+        L = detach(log pi_student - log pi_teacher) * log pi_student
+
+    Optional multiplicative correction terms:
+        - Importance sampling clip:
+              ratio = clamp(exp(log pi_student - log pi_prev), max=is_clip)
+              per_token_loss *= ratio
+
+    Aggregation: masked mean over `token_mask * sample_mask * self_distillation_mask`,
+    normalized by `global_valid_toks` (matches Verl "token-mean" aggregation).
+
+    Phase 1 limitations (see SDPO integration plan Section 9):
+        - `distillation_topk` not supported (full-vocab only)
+        - Vocab-parallel and context-parallel paths not yet implemented (DTensor
+          is unwrapped via `.to_local()`; assumes TP=1)
+    """
+
+    def __init__(self, cfg: SDPOLossConfig):
+        self.full_logit_distillation = cfg["full_logit_distillation"]
+        self.alpha = float(cfg["alpha"])
+        self.distillation_topk = cfg.get("distillation_topk", None)
+        self.distillation_add_tail = cfg.get("distillation_add_tail", True)
+        self.is_clip = cfg.get("is_clip", None)
+        self.loss_type = LossType.TOKEN_LEVEL
+
+        if not (0.0 <= self.alpha <= 1.0):
+            raise ValueError(f"SDPO alpha must be in [0, 1], got {self.alpha}")
+        if not self.full_logit_distillation and self.alpha != 1.0:
+            raise ValueError(
+                "Non-full-logit SDPO only supports reverse KL (alpha=1.0); "
+                f"got alpha={self.alpha}"
+            )
+        if self.distillation_topk is not None:
+            raise NotImplementedError(
+                "Top-k logit distillation is deferred to Phase 2. "
+                "Set distillation_topk=None for Phase 1."
+            )
+        if self.is_clip is not None and self.is_clip <= 0:
+            raise ValueError(
+                f"SDPO is_clip must be positive when set, got {self.is_clip}"
+            )
+
+    def __call__(
+        self,
+        next_token_logits: Tensor,
+        data: BatchedDataDict[SDPOLossDataDict],
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        # --- Masks ---
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        # Default to all-ones so callers that don't set it get vanilla behavior.
+        self_distillation_mask = data.get(
+            "self_distillation_mask",
+            torch.ones_like(sample_mask),
+        )
+        effective_sample_mask = sample_mask * self_distillation_mask
+        loss_mask = token_mask * effective_sample_mask.unsqueeze(-1)
+
+        # --- Student log-probs from next_token_logits ---
+        # Phase 1 covers the non-parallel path; vocab-parallel + context-parallel
+        # unwrapping to be added when we scale beyond TP=1.
+        if vocab_parallel_group is not None or context_parallel_group is not None:
+            raise NotImplementedError(
+                "SDPO vocab-parallel / context-parallel logit paths are Phase 2."
+            )
+        if isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+            next_token_logits = next_token_logits.to_local()
+
+        next_token_logits = next_token_logits.to(torch.float32)
+        student_logits = next_token_logits[:, :-1]
+        student_all_logprobs = torch.nn.functional.log_softmax(
+            student_logits, dim=-1
+        )
+
+        next_tokens = data["input_ids"][:, 1:].to(student_logits.device)
+        student_log_probs = student_all_logprobs.gather(
+            dim=-1, index=next_tokens.unsqueeze(-1)
+        ).squeeze(-1)
+
+        # --- Distillation term ---
+        if self.full_logit_distillation:
+            if "teacher_all_logprobs" not in data:
+                raise KeyError(
+                    "full_logit_distillation=True requires 'teacher_all_logprobs' "
+                    "in the batch dict (precomputed by the policy worker)."
+                )
+            teacher_all_logprobs = data["teacher_all_logprobs"].to(
+                student_all_logprobs.device
+            )
+
+            if self.alpha == 0.0:
+                # KL(teacher || student) — forward KL, student mimics teacher
+                per_vocab_kl = torch.nn.functional.kl_div(
+                    student_all_logprobs,
+                    teacher_all_logprobs,
+                    reduction="none",
+                    log_target=True,
+                )
+            elif self.alpha == 1.0:
+                # KL(student || teacher) — reverse KL
+                per_vocab_kl = torch.nn.functional.kl_div(
+                    teacher_all_logprobs,
+                    student_all_logprobs,
+                    reduction="none",
+                    log_target=True,
+                )
+            else:
+                # Generalized Jensen-Shannon via mixture
+                alpha_t = torch.tensor(
+                    self.alpha,
+                    dtype=student_all_logprobs.dtype,
+                    device=student_all_logprobs.device,
+                )
+                mixture_log_probs = torch.logsumexp(
+                    torch.stack(
+                        [
+                            student_all_logprobs + torch.log(1 - alpha_t),
+                            teacher_all_logprobs + torch.log(alpha_t),
+                        ]
+                    ),
+                    dim=0,
+                )
+                kl_teacher = torch.nn.functional.kl_div(
+                    mixture_log_probs,
+                    teacher_all_logprobs,
+                    reduction="none",
+                    log_target=True,
+                )
+                kl_student = torch.nn.functional.kl_div(
+                    mixture_log_probs,
+                    student_all_logprobs,
+                    reduction="none",
+                    log_target=True,
+                )
+                per_vocab_kl = torch.lerp(kl_student, kl_teacher, alpha_t)
+
+            per_token_loss = per_vocab_kl.sum(dim=-1)
+        else:
+            # Non-full-logit path: score-function reverse KL (Verl SDPO fallback).
+            if "teacher_logprobs" not in data:
+                raise KeyError(
+                    "Non-full-logit SDPO requires 'teacher_logprobs' in the batch dict."
+                )
+            teacher_log_probs = data["teacher_logprobs"].to(student_log_probs.device)
+            log_ratio = student_log_probs - teacher_log_probs
+            per_token_loss = log_ratio.detach() * student_log_probs
+
+        # --- Importance-sampling clip on distillation loss ---
+        if self.is_clip is not None:
+            if "prev_logprobs" not in data:
+                raise KeyError(
+                    "SDPO is_clip requires 'prev_logprobs' in the batch dict."
+                )
+            prev_logprobs = data["prev_logprobs"][:, 1:].to(student_log_probs.device)
+            negative_approx_kl = (student_log_probs - prev_logprobs).detach()
+            negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+            is_ratio = torch.exp(negative_approx_kl).clamp(max=self.is_clip)
+            per_token_loss = per_token_loss * is_ratio
+
+        # --- Aggregation (Verl "token-mean" = masked mean over token dim) ---
+        loss = masked_mean(
+            per_token_loss,
+            loss_mask,
+            global_normalization_factor=global_valid_toks,
+        )
+
+        with torch.no_grad():
+            frac_samples_with_demo = self_distillation_mask.float().mean().item()
+            empty_target_batch = float(
+                self_distillation_mask.sum().item() == 0
+            )
+            num_masked_tokens = loss_mask.sum().item()
+
+        return loss, {
+            "loss": loss.item(),
+            "self_distillation/frac_samples_with_demo": frac_samples_with_demo,
+            "self_distillation/empty_target_batch": empty_target_batch,
+            "self_distillation/num_masked_tokens": num_masked_tokens,
+            "num_valid_samples": sample_mask.sum().item(),
+        }

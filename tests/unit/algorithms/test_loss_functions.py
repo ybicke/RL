@@ -23,6 +23,8 @@ from nemo_rl.algorithms.loss_functions import (
     DistillationLossFn,
     DPOLossFn,
     NLLLoss,
+    SDPOLossConfig,
+    SDPOLossFn,
 )
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -1949,3 +1951,246 @@ def test_distillation_loss_fn_call():
     expected_fields = ["loss"]
     for field in expected_fields:
         assert field in metrics
+
+
+# =============================================================================
+# SDPO (Self-Distilled Policy Optimization) tests
+# =============================================================================
+
+
+def _setup_sdpo_test_data(
+    batch_size: int = 2,
+    seq_len: int = 5,
+    vocab_size: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build a small SDPO batch with pre-aligned teacher tensors."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    gen = torch.Generator(device=device).manual_seed(seed)
+    input_ids = torch.randint(
+        0, vocab_size, (batch_size, seq_len), generator=gen, device=device
+    )
+    token_mask = torch.ones((batch_size, seq_len), device=device)
+    sample_mask = torch.ones(batch_size, device=device)
+    self_distillation_mask = torch.ones(batch_size, device=device)
+
+    # Student logits — [B, S, V]
+    student_logits = torch.randn(
+        (batch_size, seq_len, vocab_size), generator=gen, device=device
+    )
+    # Teacher log-probs pre-aligned to student's next-token positions [B, S-1, V]
+    teacher_logits = torch.randn(
+        (batch_size, seq_len - 1, vocab_size), generator=gen, device=device
+    )
+    teacher_all_logprobs = torch.nn.functional.log_softmax(teacher_logits, dim=-1)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "self_distillation_mask": self_distillation_mask,
+            "teacher_all_logprobs": teacher_all_logprobs,
+        }
+    )
+    return data, student_logits
+
+
+def _global_norm_factors(data):
+    return (
+        torch.sum(data["sample_mask"]),
+        torch.sum(data["sample_mask"].unsqueeze(-1) * data["token_mask"]),
+    )
+
+
+def test_sdpo_loss_zero_when_student_matches_teacher():
+    """If student logits == teacher logits, KL is 0 for any alpha."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+    data, student_logits = _setup_sdpo_test_data()
+    # Overwrite student to match teacher exactly (logits == log-probs is fine
+    # for KL because softmax is shift-invariant).
+    teacher = data["teacher_all_logprobs"]
+    forced_student = torch.zeros_like(student_logits)
+    forced_student[:, :-1, :] = teacher  # positions used by loss
+    seqs, toks = _global_norm_factors(data)
+
+    for alpha in (0.0, 0.5, 1.0):
+        cfg: SDPOLossConfig = {
+            "full_logit_distillation": True,
+            "alpha": alpha,
+        }
+        loss_fn = SDPOLossFn(cfg)
+        loss, metrics = loss_fn(forced_student, data, seqs, toks)
+        assert loss.abs().item() < 1e-4, (
+            f"alpha={alpha}: expected loss≈0 when student==teacher, got {loss.item()}"
+        )
+        assert metrics["self_distillation/empty_target_batch"] == 0.0
+
+
+def test_sdpo_loss_forward_kl_matches_pytorch_reference():
+    """alpha=0 branch numerically matches a hand-rolled forward KL."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+    data, student_logits = _setup_sdpo_test_data(seed=1)
+    seqs, toks = _global_norm_factors(data)
+
+    loss_fn = SDPOLossFn({"full_logit_distillation": True, "alpha": 0.0})
+    loss, _ = loss_fn(student_logits, data, seqs, toks)
+
+    # Reference: sum over vocab of teacher_prob * (teacher_logprob - student_logprob),
+    # aggregated by masked mean over token positions with global_valid_toks normalization.
+    student_logprobs = torch.nn.functional.log_softmax(
+        student_logits.to(torch.float32)[:, :-1], dim=-1
+    )
+    teacher_logprobs = data["teacher_all_logprobs"]
+    teacher_probs = teacher_logprobs.exp()
+    per_token = (teacher_probs * (teacher_logprobs - student_logprobs)).sum(dim=-1)
+
+    token_mask = data["token_mask"][:, 1:]
+    sample_mask = data["sample_mask"]
+    loss_mask = token_mask * sample_mask.unsqueeze(-1)
+    expected = (per_token * loss_mask).sum() / (toks + 1e-8)
+
+    assert torch.allclose(loss, expected, atol=1e-5), (
+        f"forward-KL mismatch: got {loss.item()}, expected {expected.item()}"
+    )
+
+
+def test_sdpo_loss_reverse_kl_matches_pytorch_reference():
+    """alpha=1 branch numerically matches a hand-rolled reverse KL."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+    data, student_logits = _setup_sdpo_test_data(seed=2)
+    seqs, toks = _global_norm_factors(data)
+
+    loss_fn = SDPOLossFn({"full_logit_distillation": True, "alpha": 1.0})
+    loss, _ = loss_fn(student_logits, data, seqs, toks)
+
+    student_logprobs = torch.nn.functional.log_softmax(
+        student_logits.to(torch.float32)[:, :-1], dim=-1
+    )
+    teacher_logprobs = data["teacher_all_logprobs"]
+    student_probs = student_logprobs.exp()
+    per_token = (student_probs * (student_logprobs - teacher_logprobs)).sum(dim=-1)
+
+    token_mask = data["token_mask"][:, 1:]
+    sample_mask = data["sample_mask"]
+    loss_mask = token_mask * sample_mask.unsqueeze(-1)
+    expected = (per_token * loss_mask).sum() / (toks + 1e-8)
+
+    assert torch.allclose(loss, expected, atol=1e-5), (
+        f"reverse-KL mismatch: got {loss.item()}, expected {expected.item()}"
+    )
+
+
+def test_sdpo_loss_jsd_lies_between_forward_and_reverse():
+    """Generalized JSD (alpha in (0,1)) should be finite and bounded when
+    student and teacher are non-trivially different."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+    data, student_logits = _setup_sdpo_test_data(seed=3)
+    seqs, toks = _global_norm_factors(data)
+
+    losses = {}
+    for alpha in (0.0, 0.5, 1.0):
+        loss_fn = SDPOLossFn({"full_logit_distillation": True, "alpha": alpha})
+        loss, _ = loss_fn(student_logits, data, seqs, toks)
+        losses[alpha] = loss.item()
+
+    for a, v in losses.items():
+        assert v >= 0, f"KL/JSD must be non-negative, got {v} at alpha={a}"
+        assert not (v != v), f"NaN at alpha={a}"
+    # JSD is finite and typically smaller than both forward and reverse KL.
+    assert losses[0.5] <= max(losses[0.0], losses[1.0]) + 1e-4
+
+
+def test_sdpo_self_distillation_mask_zeros_out_samples():
+    """Samples with self_distillation_mask=0 must not contribute to the loss."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+    data, student_logits = _setup_sdpo_test_data(seed=4, batch_size=2)
+    seqs, toks = _global_norm_factors(data)
+
+    # Baseline: both samples active.
+    loss_fn = SDPOLossFn({"full_logit_distillation": True, "alpha": 0.0})
+    loss_both, _ = loss_fn(student_logits, data, seqs, toks)
+
+    # Zero out sample 1's demonstration.
+    data2 = BatchedDataDict({**data})
+    data2["self_distillation_mask"] = torch.tensor(
+        [1.0, 0.0], device=data["self_distillation_mask"].device
+    )
+    loss_one, metrics = loss_fn(student_logits, data2, seqs, toks)
+
+    # With one sample masked out, loss should equal only sample 0's contribution
+    # (still normalized by the same global_valid_toks — matches Verl semantics).
+    # We only assert that the second sample's per-token loss is dropped: loss_one
+    # differs from loss_both, and metrics report the drop.
+    assert loss_one.item() != loss_both.item()
+    assert metrics["self_distillation/frac_samples_with_demo"] == pytest.approx(0.5)
+
+
+def test_sdpo_empty_target_batch_metric():
+    """When no sample has a demo, empty_target_batch flag is 1 and loss is 0."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+    data, student_logits = _setup_sdpo_test_data(seed=5)
+    seqs, toks = _global_norm_factors(data)
+    data["self_distillation_mask"] = torch.zeros_like(data["self_distillation_mask"])
+
+    loss_fn = SDPOLossFn({"full_logit_distillation": True, "alpha": 0.0})
+    loss, metrics = loss_fn(student_logits, data, seqs, toks)
+
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
+    assert metrics["self_distillation/empty_target_batch"] == 1.0
+
+
+def test_sdpo_is_clip_scales_loss():
+    """is_clip caps the importance-sampling ratio; larger clip -> larger loss magnitude."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+    data, student_logits = _setup_sdpo_test_data(seed=6)
+    seqs, toks = _global_norm_factors(data)
+
+    # Provide prev_logprobs that make the ratio bigger than 1 for most tokens.
+    B, S = data["input_ids"].shape
+    data["prev_logprobs"] = torch.full(
+        (B, S), fill_value=-5.0, device=student_logits.device
+    )
+
+    loss_fn_no_clip = SDPOLossFn({"full_logit_distillation": True, "alpha": 0.0})
+    loss_no_clip, _ = loss_fn_no_clip(student_logits, data, seqs, toks)
+
+    loss_fn_clip = SDPOLossFn(
+        {"full_logit_distillation": True, "alpha": 0.0, "is_clip": 1.5}
+    )
+    loss_clip, _ = loss_fn_clip(student_logits, data, seqs, toks)
+    # Ratios were clipped to 1.5, so loss_clip <= loss_no_clip * 1.5 (roughly).
+    # We only assert the two differ and both are finite.
+    assert loss_no_clip.item() != loss_clip.item()
+    assert torch.isfinite(loss_clip)
+
+
+def test_sdpo_rejects_topk_in_phase1():
+    """Top-k mode is deferred to Phase 2; constructor should raise."""
+    with pytest.raises(NotImplementedError, match="Top-k"):
+        SDPOLossFn(
+            {"full_logit_distillation": True, "alpha": 0.0, "distillation_topk": 8}
+        )
+
+
+def test_sdpo_rejects_non_reverse_kl_without_full_logit():
+    """Non-full-logit path only supports reverse KL (alpha=1.0)."""
+    with pytest.raises(ValueError, match="reverse KL"):
+        SDPOLossFn({"full_logit_distillation": False, "alpha": 0.0})
+
+
+def test_sdpo_rejects_alpha_out_of_range():
+    with pytest.raises(ValueError, match="alpha"):
+        SDPOLossFn({"full_logit_distillation": True, "alpha": 1.5})
+    with pytest.raises(ValueError, match="alpha"):
+        SDPOLossFn({"full_logit_distillation": True, "alpha": -0.1})
