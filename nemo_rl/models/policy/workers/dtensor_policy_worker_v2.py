@@ -125,6 +125,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
         init_reference_model: bool = True,
+        init_teacher_model: bool = False,
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorkerV2."""
@@ -489,6 +490,27 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.reference_model_state_dict = get_cpu_state_dict(
                 self.model.state_dict().items(), pin_memory=True
             )
+
+        # [MORALGYM PATCH 6] SDPO EMA teacher — LoRA-only in Phase 1.
+        # Teacher tracks the actor via EMA on the LoRA adapter tensors only;
+        # base weights are aliased with the actor (never duplicated), which
+        # keeps 70B viable. Non-LoRA / full-FT teacher is deferred to Phase 2
+        # (see MoralGym/docs/implementations/sdpo_integration_plan.md §4.3).
+        if init_teacher_model:
+            if not self.lora_enabled:
+                raise NotImplementedError(
+                    "SDPO teacher currently requires LoRA (Phase 1). "
+                    "Enable dtensor_cfg.lora_cfg.enabled=True or set "
+                    "init_teacher_model=False."
+                )
+            with torch.no_grad():
+                self.teacher_lora_state = {
+                    k: to_local_if_dtensor(v).detach().clone()
+                    for k, v in self.model.state_dict().items()
+                    if ".lora_A." in k or ".lora_B." in k
+                }
+        else:
+            self.teacher_lora_state = None
 
         if init_optimizer:
             optimizer_cls = get_class(self.cfg["optimizer"]["name"])
@@ -1683,6 +1705,95 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 for k, v in self.model.state_dict().items():
                     val = to_local_if_dtensor(v)
                     val.copy_(curr_state_dict[k])
+
+    # [MORALGYM PATCH 6] SDPO teacher — EMA update and swap-in for teacher forward.
+    # Mirrors Verl's `dp_actor.py:_update_teacher` and `teacher_module` pattern
+    # (SDPO/verl/workers/actor/dp_actor.py:918-921 + line 815).
+
+    @torch.no_grad()
+    def update_teacher_ema(self, rate: float) -> None:
+        """EMA update: teacher_lora = (1 - rate) * teacher_lora + rate * actor_lora.
+
+        No-op when teacher is not initialized (allows generic algorithm code
+        to always call this at the end of a train step regardless of loss mode).
+        """
+        if self.teacher_lora_state is None:
+            return
+        if not (0.0 <= rate <= 1.0):
+            raise ValueError(
+                f"update_teacher_ema: rate must be in [0, 1], got {rate}"
+            )
+        state = self.model.state_dict()
+        for k, teacher_tensor in self.teacher_lora_state.items():
+            actor_local = to_local_if_dtensor(state[k]).detach()
+            teacher_tensor.mul_(1.0 - rate).add_(actor_local, alpha=rate)
+
+    @torch.no_grad()
+    def _teacher_ema_probe(self) -> dict[str, Any]:
+        """Test-only: return a snapshot of teacher and actor LoRA state.
+
+        Returns a dict with:
+          - "teacher_keys": list of tracked teacher keys
+          - "teacher_norms": {key: L2-norm of teacher tensor}
+          - "actor_norms": {key: L2-norm of current actor tensor for the same key}
+          - "base_weight_norms": {name: L2-norm} for a few sample base weights,
+            so tests can assert base weights are not in the teacher state.
+        """
+        if self.teacher_lora_state is None:
+            return {"teacher_keys": [], "teacher_norms": {}, "actor_norms": {}, "base_weight_norms": {}}
+        state = self.model.state_dict()
+        teacher_norms = {
+            k: teacher_tensor.detach().float().norm().item()
+            for k, teacher_tensor in self.teacher_lora_state.items()
+        }
+        actor_norms = {
+            k: to_local_if_dtensor(state[k]).detach().float().norm().item()
+            for k in self.teacher_lora_state
+        }
+        # Sample a couple of base-weight keys (non-LoRA) so tests can verify
+        # teacher does not store or mutate them.
+        base_weight_norms: dict[str, float] = {}
+        for name, tensor in state.items():
+            if ".lora_A." in name or ".lora_B." in name:
+                continue
+            if len(base_weight_norms) >= 4:
+                break
+            base_weight_norms[name] = to_local_if_dtensor(tensor).detach().float().norm().item()
+        return {
+            "teacher_keys": list(self.teacher_lora_state.keys()),
+            "teacher_norms": teacher_norms,
+            "actor_norms": actor_norms,
+            "base_weight_norms": base_weight_norms,
+        }
+
+    @contextmanager
+    def use_teacher_model(self) -> Generator[None, None, None]:
+        """Context manager that swaps teacher LoRA weights into the model.
+
+        Used by SDPO's inline teacher forward (Step 3). On entry, the actor's
+        LoRA A/B tensors are saved and teacher LoRA tensors are copied in.
+        On exit, the actor LoRA is restored. Base weights are never touched
+        (LoRA teacher shares them with the actor by design).
+        """
+        if self.teacher_lora_state is None:
+            raise RuntimeError(
+                "use_teacher_model called but teacher was not initialized. "
+                "Pass init_teacher_model=True when constructing the Policy."
+            )
+        with torch.no_grad():
+            state = self.model.state_dict()
+            # Snapshot the actor's current LoRA weights so we can restore them.
+            saved_actor_lora = {
+                k: to_local_if_dtensor(state[k]).detach().clone()
+                for k in self.teacher_lora_state
+            }
+            try:
+                for k, teacher_tensor in self.teacher_lora_state.items():
+                    to_local_if_dtensor(state[k]).copy_(teacher_tensor)
+                yield
+            finally:
+                for k, saved_tensor in saved_actor_lora.items():
+                    to_local_if_dtensor(state[k]).copy_(saved_tensor)
 
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""

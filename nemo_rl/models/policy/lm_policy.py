@@ -67,6 +67,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         weights_path: Optional[PathLike] = None,
         optimizer_path: Optional[PathLike] = None,
         init_reference_model: bool = True,
+        init_teacher_model: bool = False,
         processor: Optional[AutoProcessor] = None,
     ):
         if weights_path:
@@ -175,6 +176,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_reference_model=init_reference_model,
+            init_teacher_model=init_teacher_model,
             worker_sharding_annotations=self.sharding_annotations,
             pre_init_communication_queue=pre_init_queue,
         )
@@ -267,6 +269,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
+
+    # [MORALGYM PATCH 6] SDPO EMA teacher — broadcast RPC.
+    def update_teacher_ema(self, rate: float) -> None:
+        """Broadcast an EMA teacher update to every worker.
+
+        Called by the SDPO trainer after each optimizer step. No-op when
+        `init_teacher_model=False` (workers ignore the call).
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_teacher_ema",
+            rate=rate,
+        )
+        ray.get(futures)
 
     def get_logprobs(
         self, data: BatchedDataDict[GenerationDatumSpec]
