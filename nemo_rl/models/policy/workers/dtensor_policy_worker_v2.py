@@ -749,6 +749,102 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 "Sequence parallel is not supported with multimodal since there's an issue when you do not pass position_ids. See https://github.com/NVIDIA-NeMo/Automodel/issues/652"
                             )
 
+                    # [MORALGYM PATCH 6] SDPO — inline teacher forward.
+                    #
+                    # Algorithmic role: the teacher re-evaluates the student's
+                    # already-rolled-out response after receiving a "hint"
+                    # (a successful sibling trajectory + optional feedback)
+                    # prepended to the prompt. Both `input_ids` (student
+                    # context) and `teacher_input_ids` (reprompted context)
+                    # contain the SAME response tokens at the tail — only
+                    # the prefix differs. Nothing is generated here; both
+                    # tensors are prepared upstream by the reprompt batch
+                    # builder (Step 4 of the SDPO integration plan). See
+                    # Verl SDPO/verl/workers/actor/dp_actor.py:808-846.
+                    #
+                    # Placement (pre-student vs post-student): swapping the
+                    # teacher LoRA into the model via `.copy_()` bumps the
+                    # autograd version counter on the LoRA A/B leaf tensors.
+                    # Running teacher AFTER student would corrupt the
+                    # student's saved-for-backward references and raise
+                    # `RuntimeError: modified by an inplace operation` during
+                    # `.backward()`. Running teacher FIRST is a NeMo-RL
+                    # implementation adaptation — semantically identical to
+                    # Verl (both forwards operate on pre-existing tokens and
+                    # the KL loss doesn't care about ordering).
+                    if (
+                        "teacher_input_ids" in mb
+                        and self.teacher_lora_state is not None
+                    ):
+                        teacher_input_ids = mb["teacher_input_ids"].cuda()
+                        assert teacher_input_ids.shape == input_ids.shape, (
+                            "SDPO Phase 1 requires teacher_input_ids to have the "
+                            "same shape as input_ids "
+                            f"(got teacher={tuple(teacher_input_ids.shape)}, "
+                            f"student={tuple(input_ids.shape)}). "
+                            "The reprompt batch builder must pad/truncate to align."
+                        )
+                        assert not self.enable_seq_packing, (
+                            "SDPO Phase 1 is not compatible with sequence packing"
+                        )
+                        assert self.cp_size == 1, (
+                            "SDPO Phase 1 is not compatible with context parallel"
+                        )
+                        t_attn_raw = mb.get("teacher_attention_mask")
+                        if t_attn_raw is None:
+                            t_attn = torch.ones_like(
+                                teacher_input_ids, dtype=torch.bool
+                            )
+                        else:
+                            t_attn = t_attn_raw.cuda().bool()
+                        t_pos_raw = mb.get("teacher_position_ids")
+                        if t_pos_raw is None:
+                            t_pos = torch.arange(
+                                teacher_input_ids.shape[1],
+                                device=teacher_input_ids.device,
+                            ).repeat(teacher_input_ids.shape[0], 1)
+                        else:
+                            t_pos = t_pos_raw.cuda()
+
+                        teacher_model_args = dict(
+                            input_ids=teacher_input_ids,
+                            attention_mask=t_attn,
+                            position_ids=t_pos,
+                            use_cache=False,
+                        )
+                        if self.allow_flash_attn_args:
+                            teacher_model_args["flash_attn_kwargs"] = {}
+                        with self.use_teacher_model():
+                            with torch.no_grad():
+                                with torch.autocast(
+                                    device_type="cuda", dtype=self.dtype
+                                ):
+                                    teacher_outputs = self.model(**teacher_model_args)
+                        if isinstance(teacher_outputs, (torch.Tensor, DTensor)):
+                            teacher_logits = teacher_outputs
+                        elif not hasattr(teacher_outputs, "logits"):
+                            teacher_logits = self.model.lm_head(
+                                teacher_outputs.last_hidden_state
+                            )
+                        else:
+                            teacher_logits = teacher_outputs.logits
+                        del teacher_outputs
+                        teacher_logits = self._apply_temperature_scaling(
+                            teacher_logits
+                        )
+                        # Align to next-token positions to match student
+                        # side of the KL loss ([:, :-1, :]).
+                        if isinstance(teacher_logits, DTensor):
+                            teacher_logits_local = teacher_logits.to_local()
+                        else:
+                            teacher_logits_local = teacher_logits
+                        teacher_all_logprobs = torch.nn.functional.log_softmax(
+                            teacher_logits_local.to(torch.float32)[:, :-1, :],
+                            dim=-1,
+                        )
+                        mb["teacher_all_logprobs"] = teacher_all_logprobs.detach()
+                        del teacher_logits, teacher_logits_local
+
                     context_parallel_ctx = None
                     if self.cp_size > 1:
                         assert len(vlm_kwargs) == 0, (

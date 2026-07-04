@@ -209,6 +209,93 @@ def test_teacher_ema_lora_path(one_gpu_cluster, tiny_llama_offline_model_path):
         policy.shutdown()
 
 
+def test_inline_teacher_forward_with_sdpo_loss(
+    one_gpu_cluster, tiny_llama_offline_model_path
+):
+    """[MORALGYM PATCH 6] SDPO — Step 3 verification.
+
+    End-to-end sanity check: hand-craft a training batch that carries
+    `teacher_input_ids`, run one train step under `SDPOLossFn`, and assert
+    that the loss is finite. This exercises the inline teacher forward
+    added to the DTensor v2 worker's microbatch loop.
+    """
+    import torch
+
+    from nemo_rl.algorithms.loss_functions import SDPOLossFn
+    from nemo_rl.algorithms.utils import get_tokenizer
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+    config = create_test_config(tiny_llama_offline_model_path, dtensor_v2=True)
+    _add_lora_cfg(config, enabled=True, dim=8, alpha=16)
+    # SDPO Phase 1 is incompatible with sequence packing and dynamic batching.
+    config["dynamic_batching"]["enabled"] = False
+    config["sequence_packing"]["enabled"] = False
+    tokenizer = get_tokenizer(config["tokenizer"])
+
+    policy = Policy(
+        cluster=one_gpu_cluster,
+        config=config,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+        init_teacher_model=True,
+    )
+    try:
+        batch_size = config["train_global_batch_size"]  # 4 per create_test_config
+        seq_len = 32
+        vocab_size = tokenizer.vocab_size
+        gen = torch.Generator().manual_seed(0)
+
+        # Student input.
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), generator=gen)
+        # Teacher input MUST match student's shape for Phase 1 (worker asserts this).
+        teacher_input_ids = torch.randint(
+            0, vocab_size, (batch_size, seq_len), generator=gen
+        )
+        # Mark the last third of tokens as "response" so token_mask has 1s to hit.
+        token_mask = torch.zeros((batch_size, seq_len), dtype=torch.float32)
+        token_mask[:, (2 * seq_len) // 3 :] = 1.0
+        # Every sample is valid and has a demonstration.
+        sample_mask = torch.ones(batch_size, dtype=torch.float32)
+        self_distillation_mask = torch.ones(batch_size, dtype=torch.float32)
+        # input_lengths needed by the worker's dynamic-shape machinery.
+        input_lengths = torch.full((batch_size,), seq_len, dtype=torch.int32)
+
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "token_mask": token_mask,
+                "sample_mask": sample_mask,
+                "self_distillation_mask": self_distillation_mask,
+                "teacher_input_ids": teacher_input_ids,
+            }
+        )
+
+        loss_fn = SDPOLossFn(
+            {
+                "full_logit_distillation": True,
+                "alpha": 0.0,  # forward KL, standard SDPO default
+            }
+        )
+
+        policy.prepare_for_training()
+        results = policy.train(data, loss_fn)
+
+        assert "loss" in results, "train() did not return a 'loss' entry"
+        loss_values = results["loss"]
+        if isinstance(loss_values, torch.Tensor):
+            loss_values = loss_values.tolist()
+        assert all(math.isfinite(float(v)) for v in loss_values), (
+            f"SDPO loss must be finite, got {loss_values}"
+        )
+        assert any(float(v) != 0.0 for v in loss_values), (
+            "SDPO loss should not be identically zero — teacher forward likely inactive"
+        )
+
+    finally:
+        policy.shutdown()
+
+
 def test_teacher_requires_lora(one_gpu_cluster, tiny_llama_offline_model_path):
     """Phase 1: without LoRA, requesting a teacher must raise."""
     from nemo_rl.algorithms.utils import get_tokenizer
