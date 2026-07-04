@@ -691,6 +691,64 @@ def normalize_advantages_with_epsilon(
     return advantages
 
 
+# [MORALGYM PATCH 5] Per-step GRPO advantage computation
+def compute_per_step_advantages(
+    per_round_rewards: torch.Tensor,  # [G, K]
+    leave_one_out: bool = True,
+    per_step_values: str = "immediate",
+    return_to_go_gamma: float = 0.9,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Per-round LOO advantages for a group of G rollouts over K rounds.
+
+    Args:
+        per_round_rewards: [G, K] tensor of per-round rewards.
+        leave_one_out: Use LOO baseline (True) or group mean (False).
+        per_step_values: "immediate" — compare raw r_t across the group.
+                         "return_to_go" — compare discounted future return R_t.
+        return_to_go_gamma: Discount factor, only used when per_step_values="return_to_go".
+        eps: Numerical stability constant.
+    """
+    G, K = per_round_rewards.shape
+    if per_step_values == "return_to_go":
+        values = torch.zeros_like(per_round_rewards)
+        values[:, K - 1] = per_round_rewards[:, K - 1]
+        for t in range(K - 2, -1, -1):
+            values[:, t] = per_round_rewards[:, t] + return_to_go_gamma * values[:, t + 1]
+    else:
+        values = per_round_rewards
+
+    group_mean = values.mean(dim=0, keepdim=True)  # [1, K]
+    group_std = values.std(dim=0, keepdim=True)     # [1, K]
+    if leave_one_out and G > 1:
+        baseline = (G * group_mean - values) / (G - 1)  # [G, K]
+    else:
+        baseline = group_mean.expand_as(values)
+    return (values - baseline) / (group_std + eps)
+
+
+def compute_per_step_advantages_for_batch(
+    input_ids: torch.Tensor,          # [batch_size, seq_len]
+    per_round_rewards: torch.Tensor,  # [batch_size, K]
+    leave_one_out: bool = True,
+    per_step_values: str = "immediate",
+    return_to_go_gamma: float = 0.9,
+) -> torch.Tensor:
+    """Group rollouts by prompt, compute per-round advantages per group."""
+    per_step_advs = torch.zeros_like(per_round_rewards)
+    unique_prompts = torch.unique(input_ids, dim=0)
+    for prompt in unique_prompts:
+        mask = (input_ids == prompt).all(dim=1)
+        group_advs = compute_per_step_advantages(
+            per_round_rewards[mask],
+            leave_one_out=leave_one_out,
+            per_step_values=per_step_values,
+            return_to_go_gamma=return_to_go_gamma,
+        )
+        per_step_advs[mask] = group_advs
+    return per_step_advs
+
+
 def dynamic_sampling(
     repeated_batch: BatchedDataDict[DatumSpec],
     std: torch.Tensor,
@@ -1213,6 +1271,11 @@ def grpo_train(
                     else:
                         vllm_logger_metrics = {}
 
+                # [MORALGYM PATCH 4] Call env post-processing to collect game metrics
+                for env_actor in task_to_env.values():
+                    repeated_batch, env_metrics = ray.get(env_actor.global_post_process_and_metrics.remote(repeated_batch))
+                    rollout_metrics.update(env_metrics)
+
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]
                 )
@@ -1273,6 +1336,19 @@ def grpo_train(
                             std=std,
                         )
 
+                    # [MORALGYM PATCH 5] Per-step advantage computation
+                    adv_cfg = master_config["grpo"].get("adv_estimator", {})
+                    use_per_step = adv_cfg.get("per_step", False)
+                    per_step_advs = None
+                    if use_per_step and "per_round_rewards" in repeated_batch:
+                        per_step_advs = compute_per_step_advantages_for_batch(
+                            input_ids,
+                            repeated_batch["per_round_rewards"],
+                            leave_one_out=master_config["grpo"]["use_leave_one_out_baseline"],
+                            per_step_values=adv_cfg.get("per_step_values", "immediate"),
+                            return_to_go_gamma=adv_cfg.get("return_to_go_gamma", 0.9),
+                        )
+
                 with timer.time("data_processing"):
                     use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
                     if use_overlong_filtering:
@@ -1286,6 +1362,7 @@ def grpo_train(
                         repeated_batch["loss_multiplier"] = loss_multiplier
                     # Add loss mask and advantages to each message in LLMMessageLogType
                     for i, message_log in enumerate(repeated_batch["message_log"]):
+                        assistant_round = 0
                         for j, message in enumerate(message_log):
                             if message["role"] == "assistant":
                                 message["token_loss_mask"] = torch.ones_like(
@@ -1299,9 +1376,17 @@ def grpo_train(
                                 message["generation_logprobs"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
                                 )
-                            message["advantages"] = advantages[i].expand(
-                                message["token_ids"].shape
-                            )
+                            # [MORALGYM PATCH 5] Per-step: assign round-specific advantage to each assistant message
+                            if per_step_advs is not None and message["role"] == "assistant":
+                                round_adv = per_step_advs[i, assistant_round].item() if assistant_round < per_step_advs.shape[1] else 0.0
+                                message["advantages"] = torch.full_like(
+                                    message["token_ids"], round_adv, dtype=torch.float32
+                                )
+                                assistant_round += 1
+                            else:
+                                message["advantages"] = advantages[i].expand(
+                                    message["token_ids"].shape
+                                )
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(

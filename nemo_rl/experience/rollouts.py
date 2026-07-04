@@ -35,6 +35,7 @@ from nemo_rl.data.interfaces import (
 )
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
+    get_first_index_that_differs,  # [MULTI-TURN FIX] needed for chat template wrapping
     get_keys_from_message_log,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -51,6 +52,120 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+# =============================================================================
+# [MULTI-TURN FIX] Chat template wrapping for environment observations
+#
+# Problem: In multi-turn rollouts, environment observations (turns 2+) were
+# tokenized as raw text without chat template markers. This meant the model
+# saw garbled continuation text instead of properly formatted user turns.
+#
+# For example, with Gemma-2 the model saw:
+#   <start_of_turn>model\naction2\nYou are playing...round 2...
+# Instead of the correct:
+#   <start_of_turn>model\naction2<end_of_turn>\n<start_of_turn>user\n
+#   You are playing...round 2...<end_of_turn>\n<start_of_turn>model\n
+#
+# This fix addresses the TODO at the original lines 448 and 720:
+#   "TODO @sahilj: handle if we want these subsequent messages to have
+#    a chat template"
+#
+# The approach uses tokenizer.apply_chat_template() on a minimal conversation
+# to compute the correct bridge tokens (end-of-turn + user wrapping +
+# generation prompt) in a model-agnostic way. It reuses
+# get_first_index_that_differs already present in llm_message_utils.py.
+#
+# See also: get_formatted_message_log() in llm_message_utils.py which does
+# the same thing correctly for the initial prompt (turn 1).
+#
+# Author: Yves Bicker (MoralGym project)
+# Related NVIDIA NeMo-RL issue: multi-turn chat template TODO in rollouts.py
+# =============================================================================
+def _tokenize_env_obs_with_chat_template(
+    tokenizer: TokenizerType,
+    last_assistant_content: str,
+    env_obs_content: str,
+    env_obs_role: str = "user",
+) -> torch.Tensor:
+    """Tokenize an environment observation with proper chat template wrapping.
+
+    In multi-turn rollouts, the assistant's token_ids (from vLLM) do not include
+    end-of-turn markers because generation stops at the stop string (e.g. '\\n')
+    before producing them. When the environment returns a new observation, we need
+    to include:
+      1. The assistant's end-of-turn marker (e.g. <end_of_turn> for Gemma)
+      2. The user turn wrapper (e.g. <start_of_turn>user\\n...content...<end_of_turn>)
+      3. The generation prompt (e.g. <start_of_turn>model\\n)
+
+    This function computes these tokens in a model-agnostic way by:
+      - Building a minimal 3-message conversation [dummy_user, assistant, env_obs]
+      - Applying the chat template to get the full formatted string
+      - Diffing against what the model has already "seen" (up to the assistant's
+        raw content) to extract only the new tokens
+
+    Args:
+        tokenizer: The tokenizer with a chat template configured.
+        last_assistant_content: The raw text content of the last assistant response
+            (as returned by vLLM / tokenizer.decode, without end-of-turn markers).
+        env_obs_content: The raw text content of the environment observation.
+        env_obs_role: The role for the observation message (default: "user").
+
+    Returns:
+        torch.Tensor: Token IDs (int64) for the bridge + observation + generation
+            prompt. For Gemma-2, this would encode something like:
+            '<end_of_turn>\\n<start_of_turn>user\\n{obs}<end_of_turn>\\n
+            <start_of_turn>model\\n'
+    """
+    # Build a minimal conversation. The dummy user content ("x") does not affect
+    # the bridge tokens between assistant and the next user turn — it only serves
+    # to establish a valid conversation structure for apply_chat_template.
+    mini_messages = [
+        {"role": "user", "content": "x"},
+        {"role": "assistant", "content": last_assistant_content},
+        {"role": env_obs_role, "content": env_obs_content},
+    ]
+
+    # Full formatted conversation including generation prompt for the next turn
+    full_formatted = tokenizer.apply_chat_template(
+        mini_messages,
+        add_generation_prompt=True,
+        tokenize=False,
+        add_special_tokens=False,
+    )
+
+    # What the model has already seen: the formatted dummy user turn (with
+    # generation prompt = <start_of_turn>model\n) followed by the assistant's
+    # raw content (without end-of-turn, as produced by vLLM).
+    seen_so_far = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "x"}],
+        add_generation_prompt=True,
+        tokenize=False,
+        add_special_tokens=False,
+    ) + last_assistant_content
+
+    # Extract everything after what the model has seen. This captures:
+    # - The assistant's end-of-turn marker (missing from vLLM output)
+    # - The user turn wrapping for the env observation
+    # - The generation prompt for the model's next response
+    diff_start = get_first_index_that_differs(seen_so_far, full_formatted)
+    new_text = full_formatted[diff_start:]
+
+    token_ids = tokenizer(
+        new_text, return_tensors="pt", add_special_tokens=False
+    ).input_ids[0]
+
+    # [MULTI-TURN FIX] Debug: decode bridge tokens to verify chat template markers
+    import os
+    if os.environ.get("MORALGYM_DEBUG", "0") == "1":
+        if not getattr(_tokenize_env_obs_with_chat_template, "_logged", False):
+            decoded = tokenizer.decode(token_ids, skip_special_tokens=False)
+            print(f"\n[MULTI-TURN FIX] Bridge tokens for turn 2+ ({len(token_ids)} tokens):", flush=True)
+            print(f"  Decoded: {decoded!r}", flush=True)
+            print(f"  Token IDs: {token_ids.tolist()}", flush=True)
+            _tokenize_env_obs_with_chat_template._logged = True
+
+    return token_ids.to(dtype=torch.int64)
 
 
 def generate_responses(
@@ -358,6 +473,8 @@ def run_multi_turn_rollout(
     batch_size = len(current_batch["message_log"])
     active_indices = torch.arange(batch_size)
     total_rewards = torch.zeros(batch_size, dtype=torch.float32)
+    # [MORALGYM PATCH 5] Per-round reward tracking for per-step advantage
+    per_round_rewards: list[list[float]] = [[] for _ in range(batch_size)]
 
     # Initialize stop_strings from the initial batch if present
     current_stop_strings = current_batch.get("stop_strings", [None] * batch_size)
@@ -438,19 +555,24 @@ def run_multi_turn_rollout(
         env_output: EnvironmentReturn = calculate_rewards(active_batch, task_to_env)
 
         total_rewards[active_indices] += env_output.rewards
+        # [MORALGYM PATCH 5] Store per-round rewards
+        for i, global_idx in enumerate(active_indices.tolist()):
+            per_round_rewards[global_idx].append(env_output.rewards[i].item())
 
         # Update message log for ALL active samples with env observation
         # This must happen BEFORE filtering based on done flags
         truncation_mask = torch.zeros_like(env_output.terminateds, dtype=torch.bool)
         for i, global_idx in enumerate(active_indices.tolist()):
             env_obs_content = env_output.observations[i]["content"]
-            # Tokenize the raw content from the environment
-            # TODO @sahilj: handle if we want these subsequent messages to have a chat template
-            tokenized_obs = tokenizer(
-                env_obs_content, return_tensors="pt", add_special_tokens=False
-            ).input_ids[0]
-            # tokenizer returns torch.float32 when env_obs_content is empty
-            tokenized_obs = tokenized_obs.to(dtype=torch.int64)
+            env_obs_role = env_output.observations[i]["role"]
+
+            # [MULTI-TURN FIX] Apply chat template to env observation (replaces
+            # the original raw tokenization). The last message in the log is the
+            # assistant response just appended by generate_responses().
+            last_assistant_content = current_batch["message_log"][global_idx][-1]["content"]
+            tokenized_obs = _tokenize_env_obs_with_chat_template(
+                tokenizer, last_assistant_content, env_obs_content, env_obs_role,
+            )
 
             # check if new message overflows max_seq_len
             if (
@@ -514,6 +636,11 @@ def run_multi_turn_rollout(
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
     current_batch["truncated"] = sample_truncated
+    # [MORALGYM PATCH 5] Store per-round rewards in batch (pad to uniform length)
+    max_rounds = max((len(r) for r in per_round_rewards), default=0)
+    if max_rounds > 0:
+        padded = [r + [0.0] * (max_rounds - len(r)) for r in per_round_rewards]
+        current_batch["per_round_rewards"] = torch.tensor(padded, dtype=torch.float32)
 
     # Calculate aggregate metrics
     rollout_metrics = {
@@ -644,6 +771,8 @@ async def run_sample_multi_turn_rollout(
 
     # Sample-level metrics
     total_reward = 0.0
+    # [MORALGYM PATCH 5] Per-round reward tracking
+    per_round_reward_list: list[float] = []
     turn_count = 0
     token_count = 0
     assistant_token_count = 0
@@ -713,13 +842,20 @@ async def run_sample_multi_turn_rollout(
         env_output = calculate_rewards(sample_batch, task_to_env)
         # Update total reward
         total_reward += float(env_output.rewards[0].item())
+        # [MORALGYM PATCH 5] Store per-round reward
+        per_round_reward_list.append(float(env_output.rewards[0].item()))
         # Check termination
         terminated = env_output.terminateds[0].item()
         env_obs_content = env_output.observations[0]["content"]
-        # Tokenize environment response
-        tokenized_obs = tokenizer(
-            env_obs_content, return_tensors="pt", add_special_tokens=False
-        ).input_ids[0]
+        env_obs_role = env_output.observations[0]["role"]
+
+        # [MULTI-TURN FIX] Apply chat template to env observation (replaces
+        # the original raw tokenization). The last message in current_message_log
+        # is the assistant response just appended by generate.
+        last_assistant_content = current_message_log[-1]["content"]
+        tokenized_obs = _tokenize_env_obs_with_chat_template(
+            tokenizer, last_assistant_content, env_obs_content, env_obs_role,
+        )
 
         # Check for sequence length overflow
         if input_lengths + gen_token_count + len(tokenized_obs) >= max_seq_len:
@@ -759,6 +895,7 @@ async def run_sample_multi_turn_rollout(
         "extra_env_info": current_extra_env_info,
         "task_name": task_name,
         "total_reward": torch.tensor(total_reward),
+        "per_round_rewards": per_round_reward_list,  # [MORALGYM PATCH 5]
         "stop_strings": current_stop_strings,
         "idx": sample_idx,
     }
@@ -884,6 +1021,13 @@ def run_async_multi_turn_rollout(
                 ),
             }
         )
+
+        # [MORALGYM PATCH 5] Reconstruct per-round rewards into batch tensor
+        all_per_round = [state.get("per_round_rewards", []) for state in final_sample_states]
+        max_rounds = max((len(r) for r in all_per_round), default=0)
+        if max_rounds > 0:
+            padded = [r + [0.0] * (max_rounds - len(r)) for r in all_per_round]
+            final_batch["per_round_rewards"] = torch.tensor(padded, dtype=torch.float32)
 
         # Preserve additional fields from the original input_batch
         for key in input_batch.keys():

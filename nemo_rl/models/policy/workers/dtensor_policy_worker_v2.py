@@ -1704,11 +1704,54 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         """
         return self.model.config
 
+    def _merged_lora_state_dict(self):
+        """Yield (name, tensor) pairs with LoRA weights merged into base weights.
+
+        [LORA-REFIT FIX] When LoRA is enabled, the model state dict contains
+        lora_A/lora_B sub-module weights that vLLM doesn't understand. This
+        method merges them: W' = W + (alpha/dim) * B @ A, and yields only the
+        base weight keys that vLLM expects.
+        """
+        if not self.lora_enabled:
+            yield from self.model.state_dict().items()
+            return
+
+        state_dict = self.model.state_dict()
+        # Collect LoRA param names so we can skip them in the main loop
+        lora_keys = {k for k in state_dict if ".lora_A." in k or ".lora_B." in k}
+        # Build a map: base_name -> (lora_A_weight, lora_B_weight, scale)
+        lora_info = {}
+        for name, module in self.model.named_modules():
+            if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+                lora_info[name] = module.scale
+
+        for name, tensor in state_dict.items():
+            if name in lora_keys:
+                continue  # skip raw LoRA params
+            # Check if this base weight has a corresponding LoRA
+            # e.g. name = "model.layers.0.self_attn.q_proj.weight"
+            # module name would be "model.layers.0.self_attn.q_proj"
+            param_suffix = name.rsplit(".", 1)[-1]  # "weight"
+            module_name = name.rsplit(".", 1)[0]     # "model.layers.0.self_attn.q_proj"
+            if module_name in lora_info and param_suffix == "weight":
+                lora_a_key = f"{module_name}.lora_A.weight"
+                lora_b_key = f"{module_name}.lora_B.weight"
+                if lora_a_key in state_dict and lora_b_key in state_dict:
+                    scale = lora_info[module_name]
+                    lora_a = state_dict[lora_a_key]
+                    lora_b = state_dict[lora_b_key]
+                    # Merge: W' = W + scale * B @ A
+                    merged = tensor + scale * (lora_b @ lora_a)
+                    yield name, merged
+                    continue
+            yield name, tensor
+
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
-        for name, tensor in self.model.state_dict().items():
+        # [LORA-REFIT FIX] Use merged state dict so vLLM sees base-model keys only
+        for name, tensor in self._merged_lora_state_dict():
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
             state_dict_info[name] = (tensor.shape, self.dtype)
 
@@ -1750,7 +1793,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         def dtensor_params_generator():
             """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            for name, tensor in self.model.state_dict().items():
+            # [LORA-REFIT FIX] Use merged state dict so vLLM sees base-model weights only
+            for name, tensor in self._merged_lora_state_dict():
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()
@@ -1799,8 +1843,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         # param_iterator will return (name, tensor), we only need tensor
         dtensor_post_iter_func = lambda x: _dtensor_post_iter_func(x[1], self.dtype)
 
+        # [LORA-REFIT FIX] Use merged state dict so vLLM sees base-model weights only
         packed_broadcast_producer(
-            iterator=iter(self.model.state_dict().items()),
+            iterator=iter(list(self._merged_lora_state_dict())),
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,
