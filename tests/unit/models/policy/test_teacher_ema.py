@@ -15,13 +15,13 @@
 
 Boots a DTensor v2 Policy with LoRA and init_teacher_model=True on a
 2-layer tiny Llama, then verifies:
-  (a) teacher is initialized identical to actor LoRA
+  (a) teacher is initialized identical to actor (all params)
   (b) update_teacher_ema(rate=1.0) makes teacher == actor
   (c) update_teacher_ema(rate=0.0) is a no-op
   (d) update_teacher_ema(rate=0.5) yields the correct half-way point
-  (e) teacher storage only contains LoRA A/B tensors — base weights are not
-      tracked and cannot be mutated by the EMA update
-  (f) non-LoRA config raises NotImplementedError (Phase 1 restriction)
+  (e) teacher storage contains ALL model parameters (base + LoRA), matching
+      Verl's ref_module_fsdp full-model architecture
+  (f) non-LoRA config works (full-FT path, Phase 2 support)
 """
 
 import math
@@ -122,15 +122,9 @@ def test_teacher_ema_lora_path(one_gpu_cluster, tiny_llama_offline_model_path):
         init_teacher_model=True,
     )
     try:
-        # (a) teacher starts identical to actor
+        # (a) teacher starts identical to actor (all params)
         probe0 = _probe(policy)
-        assert len(probe0["teacher_keys"]) > 0, "expected some LoRA tensors"
-        assert all(
-            ".lora_A." in k or ".lora_B." in k for k in probe0["teacher_keys"]
-        ), (
-            "(e) teacher should track only LoRA keys, got: "
-            f"{[k for k in probe0['teacher_keys'] if '.lora_A.' not in k and '.lora_B.' not in k]}"
-        )
+        assert len(probe0["teacher_keys"]) > 0, "expected some teacher tensors"
         for k in probe0["teacher_keys"]:
             assert math.isclose(
                 probe0["teacher_norms"][k], probe0["actor_norms"][k], rel_tol=1e-6
@@ -195,14 +189,12 @@ def test_teacher_ema_lora_path(one_gpu_cluster, tiny_llama_offline_model_path):
         # (reverse triangle inequality). (b) already fully verifies EMA
         # correctness by linearity; (d) is intentionally omitted.
 
-        # (e) base weight keys are not in the teacher state (already asserted
-        # via prefix check above). Additionally verify that the EMA updates
-        # above did not touch the *tracking* of base weights — they must not
-        # appear in the teacher state at all.
+        # (e) base weight keys ARE in the teacher state — full-model teacher
+        # tracks all params (base + LoRA), matching Verl's ref_module_fsdp.
         probe_final = _probe(policy)
         for name in base_weight_norms_0:
-            assert name not in probe_final["teacher_keys"], (
-                f"(e) base weight {name} should NOT be tracked by teacher state"
+            assert name in probe_final["teacher_keys"], (
+                f"(e) base weight {name} SHOULD be tracked by full-model teacher state"
             )
 
     finally:
@@ -307,7 +299,7 @@ def test_teacher_trust_region(one_gpu_cluster, tiny_llama_offline_model_path):
     tokenizer = get_tokenizer(config["tokenizer"])
 
     # Verifications:
-    # (a) teacher_lora_state is NOT updated by update_teacher_ema in trust-region mode
+    # (a) teacher_state_dict is NOT updated by update_teacher_ema in trust-region mode
     # (b) A train step with trust-region + SDPOLossFn produces finite non-zero loss
     import torch, math, ray as _ray
     from nemo_rl.algorithms.loss_functions import SDPOLossFn
@@ -335,7 +327,7 @@ def test_teacher_trust_region(one_gpu_cluster, tiny_llama_offline_model_path):
         for k in probe1["teacher_keys"]:
             assert math.isclose(
                 probe1["teacher_norms"][k], norms0[k], rel_tol=1e-6
-            ), f"(a) trust-region teacher_lora_state changed after update_teacher_ema at {k}"
+            ), f"(a) trust-region teacher_state_dict changed after update_teacher_ema at {k}"
 
         # (b) train step produces finite non-zero loss
         batch_size = config["train_global_batch_size"]
@@ -375,36 +367,29 @@ def test_teacher_trust_region(one_gpu_cluster, tiny_llama_offline_model_path):
         policy.shutdown()
 
 
-def test_teacher_requires_lora(one_gpu_cluster, tiny_llama_offline_model_path):
-    """Phase 1: without LoRA, requesting a teacher must raise."""
+def test_teacher_works_without_lora(one_gpu_cluster, tiny_llama_offline_model_path):
+    """Full-model teacher works without LoRA (full-FT path, Phase 2)."""
     from nemo_rl.algorithms.utils import get_tokenizer
 
     config = create_test_config(tiny_llama_offline_model_path, dtensor_v2=True)
-    # Explicitly disable LoRA.
+    # Explicitly no LoRA.
     _add_lora_cfg(config, enabled=False)
     tokenizer = get_tokenizer(config["tokenizer"])
 
-    # Ray worker __init__ failures may not raise synchronously from Policy(...);
-    # they surface when the actor is next called. We probe the actor to force
-    # the check.
-    policy = None
+    policy = Policy(
+        cluster=one_gpu_cluster,
+        config=config,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+        init_teacher_model=True,
+    )
     try:
-        policy = Policy(
-            cluster=one_gpu_cluster,
-            config=config,
-            tokenizer=tokenizer,
-            init_reference_model=False,
-            init_teacher_model=True,
-        )
-        with pytest.raises(Exception) as excinfo:
-            _probe(policy)
-        msg = str(excinfo.value)
-        assert (
-            "SDPO teacher currently requires LoRA" in msg
-            or "requires LoRA" in msg
-            or "NotImplementedError" in msg
-            or "RayActorError" in type(excinfo.value).__name__
-        ), f"expected LoRA-required error, got: {msg}"
+        probe = _probe(policy)
+        assert len(probe["teacher_keys"]) > 0, "teacher should have params"
+        # No LoRA keys — all params are base weights.
+        assert all(
+            ".lora_A." not in k and ".lora_B." not in k
+            for k in probe["teacher_keys"]
+        ), "non-LoRA teacher should have only base weight keys"
     finally:
-        if policy is not None:
-            policy.shutdown()
+        policy.shutdown()
