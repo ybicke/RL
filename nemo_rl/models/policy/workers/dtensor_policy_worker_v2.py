@@ -634,14 +634,29 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         local_valid_seqs * global_batch["input_ids"].shape[1]
                     )
                 else:
+                    loss_sample_mask = global_batch["sample_mask"]
+                    # [MORALGYM PATCH 6] SDPO: normalize by distilled tokens only.
+                    # Verl's token-mean divides by loss_mask.sum() where loss_mask
+                    # already includes self_distillation_mask (SDPO/verl/trainer/
+                    # ppo/core_algos.py:1186). Counting all valid tokens instead
+                    # would scale the distillation gradient by the fraction of
+                    # reprompted samples.
+                    if "self_distillation_mask" in global_batch:
+                        loss_sample_mask = (
+                            loss_sample_mask * global_batch["self_distillation_mask"]
+                        )
                     local_valid_toks = torch.sum(
                         global_batch["token_mask"][:, 1:]
-                        * global_batch["sample_mask"].unsqueeze(-1)
+                        * loss_sample_mask.unsqueeze(-1)
                     )
 
                 to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
                 torch.distributed.all_reduce(to_reduce, group=self.dp_mesh.get_group())
                 global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
+                if "self_distillation_mask" in global_batch:
+                    # Verl clamps the denominator (min=1.0) so a batch with no
+                    # successful demonstrations yields loss 0 instead of NaN.
+                    global_valid_toks = torch.clamp(global_valid_toks, min=1.0)
 
                 if (
                     hasattr(loss_fn, "loss_type")

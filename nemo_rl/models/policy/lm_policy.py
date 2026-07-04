@@ -278,8 +278,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def update_teacher_ema(self, rate: float) -> None:
         """Broadcast an EMA teacher update to every worker.
 
-        Called by the SDPO trainer after each optimizer step. No-op when
-        `init_teacher_model=False` (workers ignore the call).
+        Called by the SDPO trainer ONCE per train() invocation (i.e. once per
+        training step, after the full minibatch loop) — mirroring Verl's
+        _update_teacher, which runs once at the end of update_policy
+        (SDPO/verl/workers/actor/dp_actor.py), not after every optimizer step.
+        No-op when `init_teacher_model=False` (workers ignore the call).
         """
         futures = self.worker_group.run_all_workers_single_data(
             "update_teacher_ema",

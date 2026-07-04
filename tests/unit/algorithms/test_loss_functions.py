@@ -2126,12 +2126,71 @@ def test_sdpo_self_distillation_mask_zeros_out_samples():
     )
     loss_one, metrics = loss_fn(student_logits, data2, seqs, toks)
 
-    # With one sample masked out, loss should equal only sample 0's contribution
-    # (still normalized by the same global_valid_toks — matches Verl semantics).
-    # We only assert that the second sample's per-token loss is dropped: loss_one
-    # differs from loss_both, and metrics report the drop.
+    # With one sample masked out, the second sample's per-token loss is dropped:
+    # loss_one differs from loss_both, and metrics report the drop. (Correct
+    # Verl-parity normalization — denominator counts distilled tokens only — is
+    # covered by test_sdpo_normalization_counts_distilled_tokens_only.)
     assert loss_one.item() != loss_both.item()
     assert metrics["self_distillation/frac_samples_with_demo"] == pytest.approx(0.5)
+
+
+def _distilled_valid_toks(data):
+    """Denominator per the worker contract: distilled tokens only, clamped.
+
+    Mirrors the DTensor V2 worker's global_valid_toks computation when
+    self_distillation_mask is present (Verl core_algos.py:1186 parity).
+    """
+    mask = data["sample_mask"]
+    if "self_distillation_mask" in data:
+        mask = mask * data["self_distillation_mask"]
+    return torch.sum(data["token_mask"][:, 1:] * mask.unsqueeze(-1)).clamp(min=1.0)
+
+
+def test_sdpo_normalization_counts_distilled_tokens_only():
+    """Verl parity: adding samples WITHOUT a demonstration must not dilute the loss.
+
+    Verl's token-mean divides by loss_mask.sum() where loss_mask includes
+    self_distillation_mask, so the per-distilled-token gradient magnitude is
+    independent of the batch success fraction. Guard the caller contract:
+    global_valid_toks must count distilled tokens only.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+    data, student_logits = _setup_sdpo_test_data(seed=5, batch_size=2)
+    loss_fn = SDPOLossFn({"full_logit_distillation": True, "alpha": 0.0})
+
+    # Reference: sample 0 alone, fully distilled.
+    subset = BatchedDataDict({k: v[:1] for k, v in data.items()})
+    loss_subset, _ = loss_fn(
+        student_logits[:1],
+        subset,
+        subset["sample_mask"].sum(),
+        _distilled_valid_toks(subset),
+    )
+
+    # Full batch where sample 1 has no demonstration.
+    data["self_distillation_mask"] = torch.tensor(
+        [1.0, 0.0], device=data["self_distillation_mask"].device
+    )
+    loss_full, _ = loss_fn(
+        student_logits,
+        data,
+        data["sample_mask"].sum(),
+        _distilled_valid_toks(data),
+    )
+    assert torch.allclose(loss_full, loss_subset, atol=1e-6), (
+        f"undistilled sample diluted the loss: {loss_full.item()} vs {loss_subset.item()}"
+    )
+
+    # All samples undistilled: clamp(min=1) denominator -> loss exactly 0, not NaN.
+    data["self_distillation_mask"] = torch.zeros_like(data["self_distillation_mask"])
+    loss_none, _ = loss_fn(
+        student_logits,
+        data,
+        data["sample_mask"].sum(),
+        _distilled_valid_toks(data),
+    )
+    assert loss_none.item() == 0.0
 
 
 def test_sdpo_empty_target_batch_metric():

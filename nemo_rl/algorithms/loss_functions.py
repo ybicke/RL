@@ -1286,8 +1286,14 @@ class SDPOLossFn(LossFunction):
               ratio = clamp(exp(log pi_student - log pi_prev), max=is_clip)
               per_token_loss *= ratio
 
-    Aggregation: masked mean over `token_mask * sample_mask * self_distillation_mask`,
-    normalized by `global_valid_toks` (matches Verl "token-mean" aggregation).
+    Aggregation: masked sum over `token_mask * sample_mask * self_distillation_mask`,
+    divided by `global_valid_toks`. CALLER CONTRACT: `global_valid_toks` must
+    count DISTILLED tokens only (token_mask * sample_mask * self_distillation_mask,
+    clamped to min 1), matching Verl's token-mean denominator `loss_mask.sum()`
+    which includes the distillation mask (core_algos.py:1186). The DTensor V2
+    worker applies this automatically when `self_distillation_mask` is in the
+    batch. Normalizing by all valid tokens instead would scale the gradient by
+    the fraction of reprompted samples.
 
     Phase 1 limitations (see SDPO integration plan Section 9):
         - `distillation_topk` not supported (full-vocab only)
