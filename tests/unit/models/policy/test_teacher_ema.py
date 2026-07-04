@@ -296,6 +296,85 @@ def test_inline_teacher_forward_with_sdpo_loss(
         policy.shutdown()
 
 
+def test_teacher_trust_region(one_gpu_cluster, tiny_llama_offline_model_path):
+    """Trust-region teacher: logit-space blend of frozen ref and current actor."""
+    from nemo_rl.algorithms.utils import get_tokenizer
+
+    config = create_test_config(tiny_llama_offline_model_path, dtensor_v2=True)
+    _add_lora_cfg(config, enabled=True, dim=8, alpha=16)
+    config["dynamic_batching"]["enabled"] = False
+    config["sequence_packing"]["enabled"] = False
+    tokenizer = get_tokenizer(config["tokenizer"])
+
+    # Verifications:
+    # (a) teacher_lora_state is NOT updated by update_teacher_ema in trust-region mode
+    # (b) A train step with trust-region + SDPOLossFn produces finite non-zero loss
+    import torch, math, ray as _ray
+    from nemo_rl.algorithms.loss_functions import SDPOLossFn
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+    policy = Policy(
+        cluster=one_gpu_cluster,
+        config=config,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+        init_teacher_model=True,
+        teacher_regularization="trust-region",
+        teacher_update_rate=0.5,   # 50/50 blend; non-trivial mix_coef
+    )
+    try:
+        probe0 = _probe(policy)
+        norms0 = dict(probe0["teacher_norms"])
+
+        # Perturb the actor.
+        _ray.get(policy.worker_group.run_all_workers_single_data("_add_noise_to_weights"))
+
+        # For trust-region, update_teacher_ema must be a no-op regardless of rate.
+        policy.update_teacher_ema(rate=1.0)
+        probe1 = _probe(policy)
+        for k in probe1["teacher_keys"]:
+            assert math.isclose(
+                probe1["teacher_norms"][k], norms0[k], rel_tol=1e-6
+            ), f"(a) trust-region teacher_lora_state changed after update_teacher_ema at {k}"
+
+        # (b) train step produces finite non-zero loss
+        batch_size = config["train_global_batch_size"]
+        seq_len = 32
+        vocab_size = tokenizer.vocab_size
+        gen = torch.Generator().manual_seed(1)
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), generator=gen)
+        teacher_input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), generator=gen)
+        token_mask = torch.zeros((batch_size, seq_len), dtype=torch.float32)
+        token_mask[:, (2 * seq_len) // 3 :] = 1.0
+        sample_mask = torch.ones(batch_size, dtype=torch.float32)
+        self_distillation_mask = torch.ones(batch_size, dtype=torch.float32)
+        input_lengths = torch.full((batch_size,), seq_len, dtype=torch.int32)
+
+        data = BatchedDataDict({
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "self_distillation_mask": self_distillation_mask,
+            "teacher_input_ids": teacher_input_ids,
+        })
+        loss_fn = SDPOLossFn({"full_logit_distillation": True, "alpha": 0.0})
+        policy.prepare_for_training()
+        results = policy.train(data, loss_fn)
+        assert "loss" in results
+        loss_values = results["loss"]
+        if isinstance(loss_values, torch.Tensor):
+            loss_values = loss_values.tolist()
+        assert all(math.isfinite(float(v)) for v in loss_values), (
+            f"trust-region SDPO loss must be finite, got {loss_values}"
+        )
+        assert any(float(v) != 0.0 for v in loss_values), (
+            "trust-region SDPO loss should not be zero"
+        )
+    finally:
+        policy.shutdown()
+
+
 def test_teacher_requires_lora(one_gpu_cluster, tiny_llama_offline_model_path):
     """Phase 1: without LoRA, requesting a teacher must raise."""
     from nemo_rl.algorithms.utils import get_tokenizer

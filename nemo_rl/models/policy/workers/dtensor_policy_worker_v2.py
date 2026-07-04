@@ -126,6 +126,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         init_optimizer: bool = True,
         init_reference_model: bool = True,
         init_teacher_model: bool = False,
+        teacher_regularization: str = "ema",
+        teacher_update_rate: float = 0.05,
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorkerV2."""
@@ -512,6 +514,9 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         else:
             self.teacher_lora_state = None
 
+        self.teacher_regularization = teacher_regularization if init_teacher_model else None
+        self.teacher_update_rate = teacher_update_rate if init_teacher_model else 0.0
+
         if init_optimizer:
             optimizer_cls = get_class(self.cfg["optimizer"]["name"])
             self.optimizer = optimizer_cls(
@@ -814,36 +819,82 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         )
                         if self.allow_flash_attn_args:
                             teacher_model_args["flash_attn_kwargs"] = {}
-                        with self.use_teacher_model():
+
+                        # Teacher forward: two modes — EMA (exponential moving
+                        # average of actor LoRA) and trust-region (logit-space
+                        # blend of the frozen initial policy and the current actor,
+                        # matching Verl's TrustRegionTeacher.forward exactly).
+                        def _extract_logits(outputs):
+                            if isinstance(outputs, (torch.Tensor, DTensor)):
+                                return outputs
+                            elif not hasattr(outputs, "logits"):
+                                return self.model.lm_head(outputs.last_hidden_state)
+                            else:
+                                return outputs.logits
+
+                        if self.teacher_regularization == "trust-region":
+                            mix_coef = self.teacher_update_rate
+                            # Forward 1: frozen initial policy (teacher_lora_state at t=0)
+                            with self.use_teacher_model():
+                                with torch.no_grad():
+                                    with torch.autocast(
+                                        device_type="cuda", dtype=self.dtype
+                                    ):
+                                        ref_outputs = self.model(**teacher_model_args)
+                            ref_logits_raw = _extract_logits(ref_outputs)
+                            del ref_outputs
+                            # Forward 2: current actor (model already has actor LoRA
+                            # after use_teacher_model() exit)
                             with torch.no_grad():
                                 with torch.autocast(
                                     device_type="cuda", dtype=self.dtype
                                 ):
-                                    teacher_outputs = self.model(**teacher_model_args)
-                        if isinstance(teacher_outputs, (torch.Tensor, DTensor)):
-                            teacher_logits = teacher_outputs
-                        elif not hasattr(teacher_outputs, "logits"):
-                            teacher_logits = self.model.lm_head(
-                                teacher_outputs.last_hidden_state
+                                    actor_outputs = self.model(**teacher_model_args)
+                            actor_logits_raw = _extract_logits(actor_outputs)
+                            del actor_outputs
+                            # Logit-space interpolation (matches Verl
+                            # TrustRegionTeacher.forward exactly)
+                            ref_local = (
+                                ref_logits_raw.to_local()
+                                if isinstance(ref_logits_raw, DTensor)
+                                else ref_logits_raw
                             )
+                            act_local = (
+                                actor_logits_raw.to_local()
+                                if isinstance(actor_logits_raw, DTensor)
+                                else actor_logits_raw
+                            )
+                            teacher_logits_raw = torch.lerp(
+                                ref_local.float(), act_local.float(), mix_coef
+                            )
+                            del ref_local, act_local
                         else:
-                            teacher_logits = teacher_outputs.logits
-                        del teacher_outputs
-                        teacher_logits = self._apply_temperature_scaling(
-                            teacher_logits
-                        )
+                            # EMA mode: single forward with teacher LoRA swapped in.
+                            with self.use_teacher_model():
+                                with torch.no_grad():
+                                    with torch.autocast(
+                                        device_type="cuda", dtype=self.dtype
+                                    ):
+                                        teacher_outputs = self.model(**teacher_model_args)
+                            teacher_logits_raw = _extract_logits(teacher_outputs)
+                            del teacher_outputs
+
+                        # Shared tail: temperature scaling + log-softmax.
                         # Align to next-token positions to match student
                         # side of the KL loss ([:, :-1, :]).
-                        if isinstance(teacher_logits, DTensor):
-                            teacher_logits_local = teacher_logits.to_local()
+                        teacher_logits_raw = self._apply_temperature_scaling(
+                            teacher_logits_raw
+                        )
+                        if isinstance(teacher_logits_raw, DTensor):
+                            teacher_logits_local = teacher_logits_raw.to_local()
                         else:
-                            teacher_logits_local = teacher_logits
+                            teacher_logits_local = teacher_logits_raw
                         teacher_all_logprobs = torch.nn.functional.log_softmax(
                             teacher_logits_local.to(torch.float32)[:, :-1, :],
                             dim=-1,
                         )
                         mb["teacher_all_logprobs"] = teacher_all_logprobs.detach()
-                        del teacher_logits, teacher_logits_local
+                        del teacher_logits_raw, teacher_logits_local
 
                     context_parallel_ctx = None
                     if self.cp_size > 1:
@@ -1815,6 +1866,8 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         """
         if self.teacher_lora_state is None:
             return
+        if self.teacher_regularization != "ema":
+            return  # trust-region: teacher is frozen at t=0, never EMA-updated
         if not (0.0 <= rate <= 1.0):
             raise ValueError(
                 f"update_teacher_ema: rate must be in [0, 1], got {rate}"

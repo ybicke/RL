@@ -68,6 +68,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         optimizer_path: Optional[PathLike] = None,
         init_reference_model: bool = True,
         init_teacher_model: bool = False,
+        teacher_regularization: str = "ema",
+        teacher_update_rate: float = 0.05,
         processor: Optional[AutoProcessor] = None,
     ):
         if weights_path:
@@ -177,6 +179,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             optimizer_path=optimizer_path,
             init_reference_model=init_reference_model,
             init_teacher_model=init_teacher_model,
+            teacher_regularization=teacher_regularization,
+            teacher_update_rate=teacher_update_rate,
             worker_sharding_annotations=self.sharding_annotations,
             pre_init_communication_queue=pre_init_queue,
         )
