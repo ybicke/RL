@@ -1876,12 +1876,17 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         if self.teacher_state_dict is None:
             return {"teacher_keys": [], "teacher_norms": {}, "actor_norms": {}, "base_weight_norms": {}}
         state = self.model.state_dict()
+        # Norms in float64: float32 accumulation over multi-million-element
+        # tensors truncates small terms once the running sum grows (CPU
+        # sequential/vectorized reduction underestimates by ~0.2% on a 16M
+        # element embedding), while GPU tree reduction does not — so float32
+        # CPU-vs-GPU norms of bit-identical tensors disagree.
         teacher_norms = {
-            k: t.detach().float().norm().item()
+            k: t.detach().double().norm().item()
             for k, t in self.teacher_state_dict.items()
         }
         actor_norms = {
-            k: to_local_if_dtensor(state[k]).detach().float().norm().item()
+            k: to_local_if_dtensor(state[k]).detach().double().norm().item()
             for k in self.teacher_state_dict
         }
         # For backward compat with tests: base_weight_norms = non-LoRA subset of teacher_norms
