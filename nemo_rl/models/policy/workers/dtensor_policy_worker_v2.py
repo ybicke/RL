@@ -602,9 +602,21 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
         for k, v in data.items():
             if torch.is_tensor(v) and len(v.shape) > 1:
+                # [MORALGYM PATCH 6] SDPO teacher tensors live in the reprompted
+                # context, which is longer than the student context; the worker
+                # aligns them to student positions via teacher_offsets after the
+                # teacher forward, so their sequence dim may legitimately differ.
+                if k.startswith("teacher_"):
+                    continue
                 assert v.shape[sequence_dim] == seq_dim_size, (
                     f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
                 )
+        if "teacher_input_ids" in data:
+            assert not self.cfg["dynamic_batching"]["enabled"], (
+                "SDPO Phase 1 is not compatible with dynamic batching (the "
+                "dynamic-shape microbatch iterator slices the sequence dim, "
+                "which would desync the student and teacher layouts)"
+            )
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -789,13 +801,31 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         and self.teacher_state_dict is not None
                     ):
                         teacher_input_ids = mb["teacher_input_ids"].cuda()
-                        assert teacher_input_ids.shape == input_ids.shape, (
-                            "SDPO Phase 1 requires teacher_input_ids to have the "
-                            "same shape as input_ids "
-                            f"(got teacher={tuple(teacher_input_ids.shape)}, "
-                            f"student={tuple(input_ids.shape)}). "
-                            "The reprompt batch builder must pad/truncate to align."
-                        )
+                        # Alignment: NemoRL right-pads with variable per-row prompt
+                        # lengths, so (unlike Verl's left-padded fixed response
+                        # offset) response tokens sit at different positions in the
+                        # teacher context. `teacher_offsets[b] = len(teacher first
+                        # message) - len(student first message)`; every token after
+                        # the swapped first message is identical, shifted right by
+                        # that delta. Teacher log-probs are gathered back to student
+                        # positions below. Without offsets, shapes must match and
+                        # rows are assumed position-aligned (delta 0, test path).
+                        teacher_offsets_raw = mb.get("teacher_offsets")
+                        if teacher_offsets_raw is None:
+                            assert teacher_input_ids.shape == input_ids.shape, (
+                                "SDPO requires teacher_offsets when "
+                                "teacher_input_ids shape differs from input_ids "
+                                f"(got teacher={tuple(teacher_input_ids.shape)}, "
+                                f"student={tuple(input_ids.shape)})."
+                            )
+                            teacher_offsets = None
+                        else:
+                            teacher_offsets = teacher_offsets_raw.cuda().long()
+                            assert (teacher_offsets >= 0).all(), (
+                                "teacher_offsets must be non-negative (the "
+                                "reprompted first message cannot be shorter than "
+                                "the original)"
+                            )
                         assert not self.enable_seq_packing, (
                             "SDPO Phase 1 is not compatible with sequence packing"
                         )
@@ -902,6 +932,29 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                             teacher_logits_local.to(torch.float32)[:, :-1, :],
                             dim=-1,
                         )
+                        if teacher_offsets is not None:
+                            # Student position p predicts student token p+1; that
+                            # token sits at teacher index p+1+delta, predicted at
+                            # teacher position p+delta. Gather produces the
+                            # student-aligned [B, S-1, V] tensor. Out-of-range
+                            # positions (student prompt/pad regions) are clamped —
+                            # they carry garbage but are zeroed by token_mask in
+                            # the loss.
+                            s_len = input_ids.shape[1] - 1
+                            t_len = teacher_all_logprobs.shape[1]
+                            gather_idx = (
+                                torch.arange(
+                                    s_len, device=teacher_all_logprobs.device
+                                )[None, :]
+                                + teacher_offsets[:, None]
+                            ).clamp_(min=0, max=t_len - 1)
+                            teacher_all_logprobs = torch.gather(
+                                teacher_all_logprobs,
+                                1,
+                                gather_idx.unsqueeze(-1).expand(
+                                    -1, -1, teacher_all_logprobs.shape[-1]
+                                ),
+                            )
                         mb["teacher_all_logprobs"] = teacher_all_logprobs.detach()
                         del teacher_logits_raw, teacher_logits_local
 
