@@ -283,15 +283,23 @@ def build_reprompt_batch(
 
         teacher_first: Optional[torch.Tensor] = None
         if solution_strs[i] is not None:
+            # extra_env_info starts as the datum's dict, but multi-turn envs
+            # replace it with their own metadata object on each step — accept
+            # a "raw_prompt" key or attribute on either.
             extra = repeated_batch["extra_env_info"][i]
-            raw_prompt = extra.get("raw_prompt") if isinstance(extra, dict) else None
+            if isinstance(extra, dict):
+                raw_prompt = extra.get("raw_prompt") or None
+            else:
+                raw_prompt = getattr(extra, "raw_prompt", None) or None
             if raw_prompt is None:
                 raise ValueError(
-                    "SDPO reprompting requires the un-templated prompt text at "
-                    "extra_env_info['raw_prompt'] (the first user message "
+                    "SDPO reprompting requires the un-templated prompt text "
+                    "at extra_env_info['raw_prompt'] (the first user message "
                     "content is already chat-templated and cannot be wrapped "
-                    "in the reprompt template again). Add it in the datum "
-                    "generator."
+                    "in the reprompt template again). Stash it in the datum "
+                    "generator; if the environment replaces extra_env_info "
+                    "with its own metadata each step, carry it through there "
+                    "too (raw_prompt key or attribute)."
                 )
             solution_section = sd_cfg["solution_template"].format(
                 successful_previous_attempt=solution_strs[i]
@@ -1134,7 +1142,9 @@ def sdpo_train(
                     policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
-                with timer.time("policy_logprobs"):
+                # Timer keeps grpo's name (despite no reference pass here)
+                # because print_performance_metrics hardcodes this key.
+                with timer.time("policy_and_reference_logprobs"):
                     # NOTE: no reference-policy logprob pass — SDPO replaces PG
                     # and Phase 1 has no KL-to-reference term (Verl default).
                     fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]

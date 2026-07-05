@@ -305,6 +305,45 @@ def test_dont_reprompt_on_self_success_in_batch():
     assert tensors["teacher_offsets"][1] > 0
 
 
+def test_raw_prompt_from_metadata_attribute():
+    """Multi-turn envs replace extra_env_info with a metadata object; the
+    builder must read raw_prompt from an attribute as well as a dict key."""
+
+    class FakeGameMetadata:
+        raw_prompt = "What is 2+2?"
+
+    tok = MockTokenizer()
+    sd_cfg = _sd_cfg()
+    log, _ = _row(5, "44")
+    batch = {
+        "message_log": [log],
+        "extra_env_info": [FakeGameMetadata()],
+        "total_reward": torch.tensor([1.0]),
+        "idx": torch.tensor([0]),
+    }
+    tensors, _ = build_reprompt_batch(batch, tok, sd_cfg, PAD_ID)
+    assert tensors["self_distillation_mask"][0] == 1.0
+    expected_first = _expected_teacher_first(tok, sd_cfg, "What is 2+2?", "44")
+    assert tensors["teacher_offsets"][0] == expected_first.shape[0] - 5
+
+
+def test_empty_raw_prompt_attribute_raises():
+    class EmptyMetadata:
+        raw_prompt = ""  # e.g. env default when the datum never stashed it
+
+    tok = MockTokenizer()
+    sd_cfg = _sd_cfg()
+    log, _ = _row(5, "44")
+    batch = {
+        "message_log": [log],
+        "extra_env_info": [EmptyMetadata()],
+        "total_reward": torch.tensor([1.0]),
+        "idx": torch.tensor([0]),
+    }
+    with pytest.raises(ValueError, match="raw_prompt"):
+        build_reprompt_batch(batch, tok, sd_cfg, PAD_ID)
+
+
 def test_missing_raw_prompt_raises():
     tok = MockTokenizer()
     sd_cfg = _sd_cfg()
