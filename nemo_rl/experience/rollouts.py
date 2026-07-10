@@ -897,7 +897,12 @@ async def run_sample_multi_turn_rollout(
         "total_reward": torch.tensor(total_reward),
         "per_round_rewards": per_round_reward_list,  # [MORALGYM PATCH 5]
         "stop_strings": current_stop_strings,
-        "idx": sample_idx,
+        # [MORALGYM PATCH 6] Preserve the datum idx (shared across a GRPO
+        # group by repeat_interleave) instead of the batch position:
+        # SDPO's sibling-demonstration bucketing groups by this uid, and
+        # overwriting it with sample_idx made every group a singleton
+        # (=> zero reprompts with dont_reprompt_on_self_success).
+        "idx": initial_sample_state.get("idx", sample_idx),
     }
 
     # Sample metrics
